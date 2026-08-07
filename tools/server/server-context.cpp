@@ -11,6 +11,8 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+
+#include "../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1121,6 +1123,98 @@ public:
         }
     }
 
+    // Builds a SERVER_TASK_TYPE_METRICS-equivalent result directly from
+    // already-persistent state, WITHOUT posting a task through queue_tasks.
+    //
+    // Why this exists: server_queue::start_loop's sleep-wait predicate has
+    // no branch for "peek at a queued task without waking" -- the ONLY exit
+    // from the parked wait is req_stop_sleeping, which the same loop
+    // iteration immediately follows with a full reload. So the normal
+    // create_response(bypass_sleep=true) pattern used by get_health/
+    // get_props (which never post a task at all) is NOT sufficient here:
+    // get_metrics posts a real task and blocks on the queue thread to
+    // process it, and that queue thread is parked. This method sidesteps
+    // the queue entirely by reading the same state the METRICS task-case
+    // dispatch (see the SERVER_TASK_TYPE_METRICS handler above) would have
+    // read, restricted to the fields that are already semantically correct
+    // while asleep:
+    //   - slots: served from sleep_slots_snapshot, a per-slot JSON array
+    //     captured once by handle_sleeping_state(true) at the moment sleep
+    //     is entered (see that function) -- NOT a live iteration of the
+    //     `slots` vector. n_idle_slots is the cached snapshot's size and
+    //     n_processing_slots is always 0: every slot is guaranteed idle at
+    //     sleep-entry (server_queue::start_loop only calls
+    //     callback_sleeping_state(true) after the task queue is confirmed
+    //     empty and callback_update_slots() has finished for that
+    //     iteration) and stays idle for the whole sleep, since nothing can
+    //     dispatch to a slot while the queue thread is parked.
+    //   - metrics.*: plain scalar accumulators, unaffected by sleep state.
+    //   - gpu_*_bytes: served from gpu_breakdown_cache (F4; last awake
+    //     snapshot), exactly like the task-case dispatch's else-branch.
+    //   - kv_cells_used: 0 (no ctx_tgt while asleep, same as the task-case
+    //     dispatch's ctx_tgt!=nullptr guard).
+    //   - kv_cells_total: n_ctx, which destroy() (sleep-entry) does not
+    //     reset, so it keeps serving its last-known value.
+    //   - n_tasks_deferred: queue_tasks.queue_tasks_deferred_size() -- a
+    //     mutex-protected read (server-queue.h's mutex_tasks is `mutable`
+    //     for exactly this const, off-loop caller).
+    //
+    // Thread safety: called from an HTTP handler thread while the queue
+    // thread is parked in the sleep-wait. This function does not read the
+    // live `slots` vector at all -- the one thing that vector's owning
+    // queue thread mutates on wake (load_model()'s slots.clear() +
+    // emplace_back() rebuild) is exactly what made the previous version of
+    // this function a genuine use-after-free/iterator-invalidation race,
+    // not a benign torn scalar read. Every field this function actually
+    // touches is either a plain scalar (metrics.*, n_ctx), a mutex-guarded
+    // read (queue_tasks_deferred_size), or a cache written exactly once,
+    // synchronously, by the queue thread at a transition boundary
+    // (gpu_breakdown_cache at the last awake METRICS dispatch;
+    // sleep_slots_snapshot at sleep-entry) and only ever read here -- never
+    // written from an HTTP handler thread. No field read by this function
+    // is mutated by the wake path, so there is no race window to accept.
+    //
+    // Precondition (not enforced here): only call this while sleeping. It
+    // assumes ctx_tgt == nullptr and does not check it -- correctness for
+    // the awake case is provided by the existing task-case dispatch, not
+    // by this method.
+    std::unique_ptr<server_task_result_metrics> build_metrics_result_while_sleeping() const {
+        auto res = std::make_unique<server_task_result_metrics>();
+        res->slots_data          = sleep_slots_snapshot;
+        res->n_idle_slots        = (int) sleep_slots_snapshot.size();
+        res->n_processing_slots  = 0;
+        res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+        res->t_start             = metrics.t_start;
+
+        res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
+        res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
+        res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
+        res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
+
+        res->n_tokens_max = metrics.n_tokens_max;
+
+        res->n_prompt_tokens_processed = metrics.n_prompt_tokens_processed;
+        res->t_prompt_processing       = metrics.t_prompt_processing;
+        res->n_tokens_predicted        = metrics.n_tokens_predicted;
+        res->t_tokens_generation       = metrics.t_tokens_generation;
+
+        res->n_decode_total     = metrics.n_decode_total;
+        res->n_busy_slots_total = metrics.n_busy_slots_total;
+
+        // Served from the last-known awake snapshot (F4) -- a sleeping
+        // model still holds VRAM, so 0 would misreport it.
+        res->gpu_model_bytes       = gpu_breakdown_cache.model_bytes;
+        res->gpu_context_bytes     = gpu_breakdown_cache.context_bytes;
+        res->gpu_compute_bytes     = gpu_breakdown_cache.compute_bytes;
+        res->gpu_unaccounted_bytes = gpu_breakdown_cache.unaccounted_bytes;
+
+        res->kv_cells_used  = 0;
+        res->kv_cells_total = (uint64_t) n_ctx;
+
+        return res;
+    }
+
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1175,6 +1269,30 @@ private:
 
     bool sleeping = false;
 
+    // Last-known per-device GPU memory breakdown, captured every time it is
+    // computed while awake (see the SERVER_TASK_TYPE_METRICS dispatch below).
+    // Served in place of the live (zeroed) computation while sleeping -- a
+    // sleeping model still holds VRAM, so 0 would misreport it. Zero-
+    // initialized default covers the window before the first awake
+    // computation (matches pre-cache "0" behavior for a never-woken model).
+    struct {
+        uint64_t model_bytes       = 0;
+        uint64_t context_bytes     = 0;
+        uint64_t compute_bytes     = 0;
+        uint64_t unaccounted_bytes = 0;
+    } gpu_breakdown_cache;
+
+    // Per-slot JSON snapshot, captured once by handle_sleeping_state(true)
+    // at the moment sleep is entered (see that function) and served by
+    // build_metrics_result_while_sleeping() in place of a live iteration of
+    // `slots`. Every slot is guaranteed idle at that exact moment (see
+    // build_metrics_result_while_sleeping()'s comment) and the queue thread
+    // owns all further `slots` mutation until the next wake, so this
+    // capture is race-free without any additional locking. Zero-
+    // initialized default (empty array) covers the window before the first
+    // sleep.
+    json sleep_slots_snapshot = json::array();
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -1197,6 +1315,18 @@ private:
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
+            // Capture the per-slot snapshot BEFORE destroy() and while
+            // still running synchronously on the queue thread -- see
+            // build_metrics_result_while_sleeping()'s comment for why this
+            // moment (and only this moment) is safe: every slot is
+            // guaranteed idle here, and no other thread mutates `slots`.
+            json snapshot = json::array();
+            for (const server_slot & slot : slots) {
+                json slot_data = slot.to_json(slots_debug == 0);
+                slot_data["state_bytes"] = (uint64_t) 0;
+                snapshot.push_back(slot_data);
+            }
+            sleep_slots_snapshot = std::move(snapshot);
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -2924,6 +3054,16 @@ private:
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
 
+                        // Per-slot serialized state size (KV cache cells for this
+                        // sequence id + sampler state), via llama_state_seq_get_size_ext
+                        // -- the same API prompt_save() above already uses per-slot.
+                        // Diagnostic-only (no penstock consumer yet); 0 when ctx_tgt is
+                        // unavailable (e.g. asleep), matching the kv_cells_used /
+                        // gpu_*_bytes sleep-edge convention in this same dispatch.
+                        slot_data["state_bytes"] = ctx_tgt != nullptr
+                            ? (uint64_t) llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                            : (uint64_t) 0;
+
                         if (slot.is_processing()) {
                             n_processing_slots++;
                         } else {
@@ -2961,6 +3101,83 @@ private:
                     res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
                     res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
                     res->n_accepted_per_pos_total  = metrics.n_accepted_per_pos_total;
+
+                    // Per-device GPU memory breakdown summed across devices.
+                    // Sourced from llama_get_memory_breakdown (public API,
+                    // src/llama-ext.h). Skips host buffers. This branch only
+                    // runs while awake (ctx_tgt/model_tgt non-null); the sleeping
+                    // case is handled two ways: (1) this dispatch's own else-branch
+                    // below serves the last-known awake snapshot via
+                    // gpu_breakdown_cache instead of 0 (F4), and (2) get_metrics's
+                    // HTTP handler now bypasses this whole task dispatch while
+                    // asleep via build_metrics_result_while_sleeping(), which reads
+                    // the same gpu_breakdown_cache directly without waking the
+                    // queue thread to run this case at all.
+                    if (ctx_tgt != nullptr && model_tgt != nullptr) {
+                        llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_tgt);
+                        const int32_t n_dev = llama_model_n_devices(model_tgt);
+                        uint64_t model_bytes = 0, context_bytes = 0, compute_bytes = 0, unaccounted_bytes = 0;
+                        for (int32_t i = 0; i < n_dev; i++) {
+                            ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+                            auto it = mb.find(buft);
+                            if (it == mb.end()) continue;
+                            const llama_memory_breakdown_data & data = it->second;
+                            size_t free_bytes = 0, total_bytes = 0;
+                            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+                            const size_t self = data.model + data.context + data.compute;
+                            const int64_t unaccounted = static_cast<int64_t>(total_bytes)
+                                - static_cast<int64_t>(free_bytes)
+                                - static_cast<int64_t>(self);
+                            model_bytes        += data.model;
+                            context_bytes      += data.context;
+                            compute_bytes      += data.compute;
+                            unaccounted_bytes  += (unaccounted > 0)
+                                ? static_cast<uint64_t>(unaccounted) : 0;
+                        }
+                        res->gpu_model_bytes       = model_bytes;
+                        res->gpu_context_bytes     = context_bytes;
+                        res->gpu_compute_bytes     = compute_bytes;
+                        res->gpu_unaccounted_bytes = unaccounted_bytes;
+
+                        // F4: cache this awake snapshot so a later sleeping read
+                        // (see the else branch below) can serve last-known values
+                        // instead of 0.
+                        gpu_breakdown_cache.model_bytes       = model_bytes;
+                        gpu_breakdown_cache.context_bytes     = context_bytes;
+                        gpu_breakdown_cache.compute_bytes     = compute_bytes;
+                        gpu_breakdown_cache.unaccounted_bytes = unaccounted_bytes;
+                    } else {
+                        // Asleep (or no ctx/model, e.g. before first load): serve
+                        // the last-known awake snapshot instead of 0 -- a sleeping
+                        // model still holds VRAM, so 0 would misreport it. Before
+                        // the first awake computation this is still the zero-
+                        // initialized default (matches pre-cache "0" behavior).
+                        res->gpu_model_bytes       = gpu_breakdown_cache.model_bytes;
+                        res->gpu_context_bytes     = gpu_breakdown_cache.context_bytes;
+                        res->gpu_compute_bytes     = gpu_breakdown_cache.compute_bytes;
+                        res->gpu_unaccounted_bytes = gpu_breakdown_cache.unaccounted_bytes;
+                    }
+
+                    // KV-pool occupancy (cells). used = sum over slots of the highest
+                    // occupied sequence position + 1 (same call as the checkpoint-restore
+                    // site above); 0 when the context is asleep (ctx_tgt == nullptr).
+                    // total = the class-level n_ctx member (unified pool capacity from
+                    // init params, set once via llama_n_ctx(ctx_tgt) at load time).
+                    // destroy() (sleep-entry) does not reset n_ctx, so total keeps
+                    // serving its last-known value across sleep/wake -- used stays 0
+                    // while asleep, so used <= total holds trivially in that state too.
+                    // With --kv-unified on (penstock's preset) this is pool-wide
+                    // occupancy, not per-slot.
+                    uint64_t kv_cells_used = 0;
+                    if (ctx_tgt != nullptr) {
+                        for (server_slot & slot : slots) {
+                            const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            kv_cells_used += (p_max >= 0) ? static_cast<uint64_t>(p_max + 1) : 0;
+                        }
+                    }
+                    res->kv_cells_used  = kv_cells_used;
+                    res->kv_cells_total = (uint64_t) n_ctx;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -4845,35 +5062,51 @@ void server_routes::init_routes() {
     };
 
     this->get_metrics = [this](const server_http_req & req) {
-        auto res = create_response();
+        // Sleeping: build the metrics result directly from persistent
+        // state instead of posting a task through queue_tasks and letting
+        // create_response() force a wake to process it. See
+        // build_metrics_result_while_sleeping()'s comment (server_context_impl,
+        // above in this file) for why the queue itself cannot process a
+        // task without fully waking -- bypass_sleep=true on create_response()
+        // is safe here because this path never touches ctx_server/ctx_tgt.
+        const bool was_sleeping = ctx_server.queue_tasks.is_sleeping();
+        auto res = create_response(/* bypass_sleep = */ was_sleeping);
         if (!params.endpoint_metrics) {
             res->error(format_error_response("This server does not support metrics endpoint. Start it with `--metrics`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 
-        // request slots data using task queue
-        {
-            server_task task(SERVER_TASK_TYPE_METRICS);
-            task.id = res->rd.get_new_id();
-            res->rd.post_task(std::move(task), true); // high-priority task
-        }
+        std::unique_ptr<server_task_result_metrics> res_task_owned;
+        server_task_result_metrics * res_task = nullptr;
 
-        // get the result
-        auto result = res->rd.next(req.should_stop);
-        if (!result) {
-            // connection was closed
-            GGML_ASSERT(req.should_stop());
-            return res;
-        }
+        if (was_sleeping) {
+            res_task_owned = ctx_server.build_metrics_result_while_sleeping();
+            res_task = res_task_owned.get();
+        } else {
+            // request slots data using task queue
+            {
+                server_task task(SERVER_TASK_TYPE_METRICS);
+                task.id = res->rd.get_new_id();
+                res->rd.post_task(std::move(task), true); // high-priority task
+            }
 
-        if (result->is_error()) {
-            res->error(result->to_json());
-            return res;
-        }
+            // get the result
+            auto result = res->rd.next(req.should_stop);
+            if (!result) {
+                // connection was closed
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
 
-        // TODO: get rid of this dynamic_cast
-        auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
-        GGML_ASSERT(res_task != nullptr);
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+
+            // TODO: get rid of this dynamic_cast
+            res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+            GGML_ASSERT(res_task != nullptr);
+        }
 
         // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
         json all_metrics_def = json {
@@ -4934,6 +5167,30 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "gpu_model_bytes"},
+                    {"help",  "Sum across GPU devices of model-tensor bytes allocated by the llama_context. Static (one snapshot per model load)."},
+                    {"value",  (uint64_t) res_task->gpu_model_bytes}
+            },{
+                    {"name",  "gpu_context_bytes"},
+                    {"help",  "Sum across GPU devices of KV-cache / context bytes allocated by the llama_context. Grows with n_ctx x n_parallel x cache quant size."},
+                    {"value",  (uint64_t) res_task->gpu_context_bytes}
+            },{
+                    {"name",  "gpu_compute_bytes"},
+                    {"help",  "Sum across GPU devices of temporary compute-buffer bytes allocated by the llama_context. Spikes per decode then freed."},
+                    {"value",  (uint64_t) res_task->gpu_compute_bytes}
+            },{
+                    {"name",  "gpu_unaccounted_bytes"},
+                    {"help",  "Sum across GPU devices of driver-used bytes NOT attributed to model + context + compute (cudaMalloc overhead, scratch, fragmentation)."},
+                    {"value",  (uint64_t) res_task->gpu_unaccounted_bytes}
+            },{
+                    {"name",  "kv_cells_used"},
+                    {"help",  "Sum over slots of occupied KV-cache cells (highest occupied sequence position + 1). With --kv-unified this is pool-wide occupancy, not per-slot. 0 when the context is asleep."},
+                    {"value",  (uint64_t) res_task->kv_cells_used}
+            },{
+                    {"name",  "kv_cells_total"},
+                    {"help",  "Unified KV-cache pool capacity from init params (llama_n_ctx at load time). Stable across sleep/wake."},
+                    {"value",  (uint64_t) res_task->kv_cells_total}
             }}}
         };
 

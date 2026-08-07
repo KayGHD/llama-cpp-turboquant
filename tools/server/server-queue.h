@@ -22,7 +22,7 @@ private:
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
 
-    std::mutex mutex_tasks;
+    mutable std::mutex mutex_tasks;
     std::condition_variable condition_tasks;
 
     // callback functions
@@ -51,7 +51,7 @@ public:
     // returns immediately if not sleeping
     void wait_until_no_sleep();
 
-    bool is_sleeping() {
+    bool is_sleeping() const {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
     }
@@ -76,7 +76,7 @@ public:
     void start_loop(int64_t idle_sleep_ms = -1);
 
     // for metrics
-    size_t queue_tasks_deferred_size() {
+    size_t queue_tasks_deferred_size() const {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return queue_tasks_deferred.size();
     }

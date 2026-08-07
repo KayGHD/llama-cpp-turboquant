@@ -35,6 +35,10 @@ struct common_subproc {
 
     bool alive();
 
+    // POSIX PID of the child process while it is alive; -1 if not alive or not supported
+    // (e.g. Windows, where subprocess_s has no pid_t field)
+    int pid();
+
     // true if LLAMA_SUBPROCESS was enabled at build time; when false, create() always fails
     static bool is_supported();
 

@@ -537,6 +537,21 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_draft_verif_steps_total = 0;
     std::vector<uint64_t> n_accepted_per_pos_total;
 
+    // Per-device GPU memory breakdown summed across devices (bytes).
+    // Populated from llama_get_memory_breakdown in the METRICS task dispatch.
+    // 0 when the context is asleep or no GPU device is present.
+    uint64_t gpu_model_bytes      = 0;
+    uint64_t gpu_context_bytes    = 0;
+    uint64_t gpu_compute_bytes    = 0;
+    uint64_t gpu_unaccounted_bytes = 0;
+
+    // KV-pool occupancy (cells). Populated in the METRICS task dispatch.
+    // kv_cells_total is the class-level n_ctx member (unified pool capacity
+    // from init params), which survives sleep/wake. kv_cells_used is 0 when
+    // the context is asleep.
+    uint64_t kv_cells_used  = 0;
+    uint64_t kv_cells_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

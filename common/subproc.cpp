@@ -61,6 +61,14 @@ bool common_subproc::alive() {
     return is_created && subprocess_alive(&proc);
 }
 
+int common_subproc::pid() {
+#if defined(_WIN32)
+    return -1;
+#else
+    return alive() ? (int)proc.child : -1;
+#endif
+}
+
 FILE * common_subproc::stdin_file() {
     return is_created ? subprocess_stdin(&proc) : nullptr;
 }
@@ -116,6 +124,10 @@ bool common_subproc::has_handle() const {
 
 bool common_subproc::alive() {
     return false;
+}
+
+int common_subproc::pid() {
+    return -1;
 }
 
 FILE * common_subproc::stdin_file() {

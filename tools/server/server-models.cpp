@@ -431,6 +431,7 @@ void server_models::load_models() {
                 /* aliases       */ {},
                 /* tags          */ {},
                 /* port          */ 0,
+                /* pid           */ 0,
                 /* status        */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used     */ 0,
                 /* args          */ std::vector<std::string>(),
@@ -604,6 +605,7 @@ void server_models::load_models() {
                     /* aliases       */ {},
                     /* tags          */ {},
                     /* port          */ 0,
+                    /* pid           */ 0,
                     /* status        */ SERVER_MODEL_STATUS_UNLOADED,
                     /* last_used     */ 0,
                     /* args          */ std::vector<std::string>(),
@@ -820,6 +822,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!inst.subproc->sproc.create(child_args, options, child_env)) {
             throw std::runtime_error("failed to spawn server instance");
         }
+        inst.meta.pid = inst.subproc->sproc.pid();
     }
 
     // start a thread to manage the child process
@@ -1000,6 +1003,11 @@ void server_models::update_status(const std::string & name, const update_status_
         auto & meta = it->second.meta;
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
+            // invalidate the stale spawn-time PID once the child has exited --
+            // otherwise a later OS-recycled PID could be misattributed to this model
+            meta.pid = 0;
+        }
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
         }
@@ -1567,7 +1575,30 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
-        if (autoload) {
+        // /metrics is a passive observation endpoint, shared here with
+        // /slots and /lora-adapters (this same proxy_get lambda serves all
+        // three -- see server.cpp's routes.get_metrics/get_slots/
+        // get_lora_adapters wiring). Autoloading on /slots or
+        // /lora-adapters legitimately means "the caller wants to interact
+        // with the model, spin it up" -- but a monitoring poll hitting
+        // /metrics should never force-spawn a model that was never started,
+        // just to report on it. Gate ONLY /metrics: skip
+        // ensure_model_ready's UNLOADED->load() branch when the model
+        // genuinely isn't running (never spawned / exited / failed).
+        // SLEEPING is unaffected either way -- ensure_model_ready already
+        // treats SLEEPING as "don't wait" (it's running, just parked), and
+        // the child's own /metrics handler now serves the sleeping case
+        // without waking it (build_metrics_result_while_sleeping,
+        // server-context.cpp).
+        if (autoload && req.path == "/metrics") {
+            auto meta = models.get_meta(name);
+            if (meta.has_value() && !meta->is_running()) {
+                res_err(error_res, format_error_response(
+                        "model '" + name + "' is not running -- refusing to autoload it just to serve /metrics",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return error_res;
+            }
+        } else if (autoload) {
             models.ensure_model_ready(name);
         }
         return models.proxy_request(req, method, name, false);
@@ -1633,6 +1664,8 @@ void server_models_routes::init_routes() {
             json status {
                 {"value",  server_model_status_to_string(meta.status)},
                 {"args",   meta.args},
+                {"pid",    meta.pid},
+                {"port",   meta.port},
             };
             if (!meta.preset.name.empty()) {
                 common_preset preset_copy = meta.preset;
